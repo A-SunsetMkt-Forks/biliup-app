@@ -4,27 +4,34 @@
 // Learn more about Tauri commands at https://tauri.app/v1/guides/features/command
 use anyhow::Context;
 use biliup::client::StatelessClient;
-use biliup::uploader::credential::{Credential as BiliCredential};
+use biliup::credential::login_by_cookies;
 use biliup::uploader::bilibili::{Studio, Video};
+use biliup::uploader::credential::Credential as BiliCredential;
 use biliup::uploader::{line, Account, Config, User, VideoFile};
 use futures::future::abortable;
-use std::borrow::Cow;
-use std::path::PathBuf;
 use std::str::FromStr;
-use biliup::credential::login_by_cookies;
+use std::{borrow::Cow, time::Instant};
+use std::{path::PathBuf, time::Duration};
+use tokio::sync::mpsc;
 
 use biliup_app::error::{Error, Result};
-use biliup_app::{config_file, config_path, cookie_file, encode_hex, Credential, Progressbar, login_by_password};
+use biliup_app::{
+    config_file, config_path, cookie_file, encode_hex, login_by_password, Credential, Progressbar,
+};
 use futures::StreamExt;
-use tauri::async_runtime;
-use tauri::{Window, Manager};
-use tokio::sync::mpsc;
+use tauri::async_runtime::{self, spawn};
+use tauri::{Emitter, Listener, Manager, Window};
 use tracing::info;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{filter::LevelFilter, prelude::*, Layer, Registry};
 
 #[tauri::command]
-fn login(app: tauri::AppHandle, username: &str, password: &str, remember_me: bool) -> Result<String> {
+fn login(
+    app: tauri::AppHandle,
+    username: &str,
+    password: &str,
+    remember_me: bool,
+) -> Result<String> {
     async_runtime::block_on(login_by_password(&app, username, password))?;
     if remember_me {
         match load(app.clone()) {
@@ -39,18 +46,20 @@ fn login(app: tauri::AppHandle, username: &str, password: &str, remember_me: boo
             }
             Err(_) => {
                 // let file = std::fs::File::create("config.yaml").with_context(|| "create config.yaml")?;
-                save(app.clone(),
-                     Config {
-                    user: Some(User {
-                        account: Account {
-                            username: username.into(),
-                            password: password.into(),
-                        },
-                    }),
-                    line: None,
-                    limit: 3,
-                    streamers: Default::default(),
-                })?;
+                save(
+                    app.clone(),
+                    Config {
+                        user: Some(User {
+                            account: Account {
+                                username: username.into(),
+                                password: password.into(),
+                            },
+                        }),
+                        line: None,
+                        limit: 3,
+                        streamers: Default::default(),
+                    },
+                )?;
             }
         }
     }
@@ -63,14 +72,17 @@ fn logout(credential: tauri::State<'_, Credential>) {
 }
 
 #[tauri::command]
-async fn login_by_cookie(app: tauri::AppHandle, credential: tauri::State<'_, Credential>) -> Result<String> {
+async fn login_by_cookie(
+    app: tauri::AppHandle,
+    credential: tauri::State<'_, Credential>,
+) -> Result<String> {
     credential.get_current_user_credential(&app).await?;
     Ok("登录成功".into())
 }
 
 #[tauri::command]
 async fn login_by_sms(app: tauri::AppHandle, code: u32, res: serde_json::Value) -> Result<String> {
-    let info = BiliCredential::new().login_by_sms(code, res).await?;
+    let info = BiliCredential::new(None).login_by_sms(code, res).await?;
     let file = std::fs::File::create(cookie_file(&app)?)?;
     serde_json::to_writer_pretty(&file, &info)?;
     println!("短信登录成功，数据保存在{:?}", file);
@@ -79,13 +91,15 @@ async fn login_by_sms(app: tauri::AppHandle, code: u32, res: serde_json::Value) 
 
 #[tauri::command]
 async fn send_sms(country_code: u32, phone: u64) -> Result<serde_json::Value> {
-    let ret = BiliCredential::new().send_sms(phone, country_code).await?;
+    let ret = BiliCredential::new(None)
+        .send_sms(phone, country_code)
+        .await?;
     Ok(ret)
 }
 
 #[tauri::command]
 async fn login_by_qrcode(app: tauri::AppHandle, res: serde_json::Value) -> Result<String> {
-    let info = BiliCredential::new().login_by_qrcode(res).await?;
+    let info = BiliCredential::new(None).login_by_qrcode(res).await?;
     let file = std::fs::File::create(cookie_file(&app)?)?;
     serde_json::to_writer_pretty(&file, &info)?;
     println!("链接登录成功，数据保存在{:?}", file);
@@ -94,7 +108,7 @@ async fn login_by_qrcode(app: tauri::AppHandle, res: serde_json::Value) -> Resul
 
 #[tauri::command]
 async fn get_qrcode() -> Result<serde_json::Value> {
-    let mut qrcode = BiliCredential::new().get_qrcode().await?;
+    let mut qrcode = BiliCredential::new(None).get_qrcode().await?;
     let response = reqwest::ClientBuilder::new()
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -133,12 +147,9 @@ async fn upload(
     let config = load(app.clone())?;
     let probe = if let Some(line) = config.line {
         match line.as_str() {
-            "kodo" => line::kodo(),
             "bda2" => line::bda2(),
             "ws" => line::ws(),
             "qn" => line::qn(),
-            "cos" => line::cos(),
-            "cos-internal" => line::cos_internal(),
             _ => unreachable!(),
         }
     } else {
@@ -174,23 +185,47 @@ async fn upload(
             // is_remove.store(false, Ordering::Relaxed);
         },
     );
-    let f2 = filename.clone();
-    let w2 = window.clone();
+
     //fixme
     //使用progressbar返回上传进度遇到错误触发重传时，会重新往channel2中写入信息，导致进度条超过100%，故使用channel1来传输进度。
     //而channel1每10MB左右才会传输一次进度，故保留channel1的信息来计算速度。
-    tokio::spawn(async move {
-        while let Some(uploaded) = rx.recv().await {
-            window
-                .emit("progress", (&filename, uploaded, total_size))
-                .unwrap();
+    spawn(async move {
+        let mut last_emit = Instant::now();
+        let throttle = Duration::from_millis(999);
+        let mut len_one_shot = 0;
+        let mut last_uploaded = 0;
+
+        loop {
+            tokio::select! {
+                Some(uploaded) = rx.recv() => {
+                    last_uploaded = uploaded;
+                },
+                Some(len) = rx2.recv() => {
+                    len_one_shot += len;
+                },
+                else => break,
+            }
+            let now = Instant::now();
+            if now.duration_since(last_emit) > throttle {
+                info!("updated");
+                let _ = window
+                    .emit(
+                        "progress",
+                        (&filename, last_uploaded, len_one_shot, total_size),
+                    )
+                    .unwrap();
+                len_one_shot = 0;
+                last_emit = now;
+            }
         }
+        // flush
+        info!("flush {}", filename);
+        let _ = window.emit(
+            "progress",
+            (&filename, total_size, len_one_shot, total_size),
+        );
     });
-    tokio::spawn(async move {
-        while let Some(len) = rx2.recv().await {
-            w2.emit("speed", (&f2, len, total_size)).unwrap();
-        }
-    });
+
     video = a_video.await??;
     println!("上传成功");
     Ok(video)
@@ -203,18 +238,24 @@ async fn submit(
     credential: tauri::State<'_, Credential>,
 ) -> Result<serde_json::Value> {
     let login_info = &*credential.get_current_user_credential(&app).await?;
-    let ret = login_info.submit(&studio).await?;
+    let ret = login_info.submit_by_app(&studio, None).await?;
     Ok(ret.data.unwrap())
 }
 
 #[tauri::command]
-async fn archive_pre(app: tauri::AppHandle, credential: tauri::State<'_, Credential>) -> Result<serde_json::Value> {
+async fn archive_pre(
+    app: tauri::AppHandle,
+    credential: tauri::State<'_, Credential>,
+) -> Result<serde_json::Value> {
     let login_info = &*credential.get_current_user_credential(&app).await?;
     Ok(login_info.archive_pre().await?)
 }
 
 #[tauri::command]
-async fn get_myinfo(app: tauri::AppHandle, credential: tauri::State<'_, Credential>) -> Result<serde_json::Value> {
+async fn get_myinfo(
+    app: tauri::AppHandle,
+    credential: tauri::State<'_, Credential>,
+) -> Result<serde_json::Value> {
     let login_info = &*credential.get_current_user_credential(&app).await?;
     Ok(login_info
         .client
@@ -229,7 +270,7 @@ async fn get_myinfo(app: tauri::AppHandle, credential: tauri::State<'_, Credenti
 async fn get_others_myinfo(app: tauri::AppHandle, file_name: String) -> Result<serde_json::Value> {
     println!("file_name {:?}", file_name);
 
-    let login_info = login_by_cookies(config_path(&app)?.join(file_name)).await?;
+    let login_info = login_by_cookies(config_path(&app)?.join(file_name), None).await?;
 
     Ok(login_info
         .client
@@ -273,15 +314,31 @@ async fn cover_up(
 }
 
 #[tauri::command]
+// 异步函数，用于下载封面并返回base64编码的字符串
+async fn download_cover_base64(
+    // tauri应用程序句柄
+    app: tauri::AppHandle,
+    input: String,
+    credential: tauri::State<'_, Credential>,
+) -> Result<String> {
+    let bili = &*credential.get_current_user_credential(&app).await?;
+    Ok(bili.download_cover_base64(&input).await?)
+}
+
+#[tauri::command]
 fn is_vid(input: &str) -> bool {
     biliup::uploader::bilibili::Vid::from_str(input).is_ok()
 }
 
 #[tauri::command]
-async fn show_video(app: tauri::AppHandle, input: &str, credential: tauri::State<'_, Credential>) -> Result<Studio> {
+async fn show_video(
+    app: tauri::AppHandle,
+    input: &str,
+    credential: tauri::State<'_, Credential>,
+) -> Result<Studio> {
     let login_info = &*credential.get_current_user_credential(&app).await?;
     let data = login_info
-        .video_data(&biliup::uploader::bilibili::Vid::from_str(input)?)
+        .video_data(&biliup::uploader::bilibili::Vid::from_str(input)?, None)
         .await?;
     let mut data = dbg!(data);
     let mut studio: Studio = serde_json::from_value(data["archive"].take())?;
@@ -304,7 +361,11 @@ async fn edit_video(
     studio: Studio,
     credential: tauri::State<'_, Credential>,
 ) -> Result<serde_json::Value> {
-    let ret = credential.get_current_user_credential(&app).await?.edit(&studio).await?;
+    let ret = credential
+        .get_current_user_credential(&app)
+        .await?
+        .edit_by_web(&studio)
+        .await?;
     Ok(ret)
 }
 
@@ -314,7 +375,8 @@ fn log(level: &str, msg: &str) -> Result<()> {
     Ok(())
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_http::init())
@@ -324,7 +386,8 @@ fn main() {
             let stdout_log = tracing_subscriber::fmt::layer()
                 .pretty()
                 .with_filter(LevelFilter::INFO);
-            let file_appender = tracing_appender::rolling::never(config_path(app.handle())?, "biliup.log");
+            let file_appender =
+                tracing_appender::rolling::never(config_path(app.handle())?, "biliup.log");
             // let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
             let file_layer = tracing_subscriber::fmt::layer()
                 .with_ansi(false)
@@ -355,6 +418,7 @@ fn main() {
             get_myinfo,
             get_others_myinfo,
             cover_up,
+            download_cover_base64,
             is_vid,
             show_video,
             edit_video,
@@ -362,6 +426,19 @@ fn main() {
             logout
         ])
         .manage(Credential::default())
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri app")
+        .run(|_app_handle, event| {
+            // let _ = log("info", &format!("Event triggered {:?}", event));
+            match event {
+                tauri::RunEvent::WindowEvent {
+                    label: _,
+                    event: ref _e,
+                    ..
+                } => {
+                    // let _ = log("error", &format!("Event triggered {:?}, {:?}", event, e));
+                }
+                _ => {}
+            }
+        });
 }
